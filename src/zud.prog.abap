@@ -377,7 +377,9 @@ CLASS lcl_tr_manager IMPLEMENTATION.
       ENDIF.
 
       APPEND INITIAL LINE TO rt_files ASSIGNING FIELD-SYMBOL(<fs_file>).
-      CASE lr_file->name(1).
+      <fs_file>-name = lr_file->name.
+
+      CASE <fs_file>-name(1).
         WHEN mc_file_types-cofile.
           <fs_file>-file_type = mc_file_types-cofile.
         WHEN mc_file_types-data.
