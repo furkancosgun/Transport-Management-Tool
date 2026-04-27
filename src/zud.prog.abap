@@ -38,6 +38,8 @@ CLASS lcx_transport_manager_message DEFINITION
     INTERFACES if_t100_dyn_msg.
     INTERFACES if_t100_message.
 
+    TYPES tt_stdout TYPE STANDARD TABLE OF tpstdout WITH DEFAULT KEY.
+
     CONSTANTS:
       BEGIN OF mc_general_error,
         msgid TYPE symsgid      VALUE '00',
@@ -52,6 +54,7 @@ CLASS lcx_transport_manager_message DEFINITION
     DATA msgv2 TYPE msgv2.
     DATA msgv3 TYPE msgv3.
     DATA msgv4 TYPE msgv4.
+    DATA mt_stdout TYPE tt_stdout.
 
     METHODS constructor
       IMPORTING textid    LIKE if_t100_message=>t100key OPTIONAL
@@ -67,6 +70,11 @@ CLASS lcx_transport_manager_message DEFINITION
 
     CLASS-METHODS raise_syst
       RAISING lcx_transport_manager_message.
+
+    CLASS-METHODS raise_tp_failure
+      IMPORTING iv_message TYPE string
+                it_stdout  TYPE tt_stdout
+      RAISING   lcx_transport_manager_message.
 
   PRIVATE SECTION.
     DATA message TYPE string.
@@ -116,6 +124,25 @@ CLASS lcx_transport_manager_message IMPLEMENTATION.
                 msgv2  = lv_message+050(50)
                 msgv3  = lv_message+100(50)
                 msgv4  = lv_message+150(50).
+  ENDMETHOD.
+
+  METHOD raise_tp_failure.
+    " Raises exception carrying a custom message AND tp stdout output
+    DATA lv_message TYPE c LENGTH 200.
+    DATA lo_ex      TYPE REF TO lcx_transport_manager_message.
+
+    lv_message = iv_message.
+
+    lo_ex = NEW lcx_transport_manager_message(
+      textid = lcx_transport_manager_message=>mc_general_error
+      msgv1  = lv_message+000(50)
+      msgv2  = lv_message+050(50)
+      msgv3  = lv_message+100(50)
+      msgv4  = lv_message+150(50) ).
+
+    lo_ex->mt_stdout = it_stdout.
+
+    RAISE EXCEPTION lo_ex.
   ENDMETHOD.
 ENDCLASS.
 
@@ -501,11 +528,15 @@ CLASS lcl_transport_manager IMPLEMENTATION.
     " (object-list import phase) WITHOUT performing a real import.
     " Equivalent of OS-level: tp cmd <TR> <SID> pf=<tp_profile>
     DATA lv_system  TYPE tmsbuffer-sysnam.
+    DATA lv_client  TYPE tmsbuffer-tarcli.
     DATA lv_request TYPE tmsbuffer-trkorr.
     DATA lv_rc      TYPE stpa-retcode.
     DATA lv_msg     TYPE stpa-message.
+    DATA lt_stdout  TYPE lcx_transport_manager_message=>tt_stdout.
+    DATA lv_syst_msg TYPE c LENGTH 200.
 
     lv_system  = sy-sysid.
+    lv_client  = sy-mandt.
     lv_request = iv_request.
 
     " Authority check for adding to buffer
@@ -532,9 +563,12 @@ CLASS lcl_transport_manager IMPLEMENTATION.
     " 'CMD' = IF_OCS_TRANSPORT_SYSTEM_ACCESS=>C_CMD_OBJLST_IMPORT.
     CALL FUNCTION 'TRINT_TP_INTERFACE'
       EXPORTING  iv_tp_command                = 'CMD'
+                 iv_system_name               = lv_system
                  iv_transport_request         = lv_request
+                 iv_client                    = lv_client
       IMPORTING  ev_tp_return_code            = lv_rc
                  ev_tp_message                = lv_msg
+      TABLES     tt_stdout                    = lt_stdout
       EXCEPTIONS unsupported_tp_command       = 1
                  invalid_tp_command           = 2
                  missing_parameter            = 3
@@ -548,13 +582,19 @@ CLASS lcl_transport_manager IMPLEMENTATION.
                  insert_tplog_failed          = 11
                  OTHERS                       = 12.
     IF sy-subrc <> 0.
-      lcx_transport_manager_message=>raise_syst( ).
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              INTO lv_syst_msg
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      lcx_transport_manager_message=>raise_tp_failure(
+        iv_message = CONV string( lv_syst_msg )
+        it_stdout  = lt_stdout ).
     ENDIF.
 
     " tp return codes > 4 indicate errors (0/4 = OK / warnings).
     IF lv_rc > 4.
-      lcx_transport_manager_message=>raise(
-        |Populate failed (tp RC={ lv_rc }): { lv_msg }| ).
+      lcx_transport_manager_message=>raise_tp_failure(
+        iv_message = |Populate failed (tp RC={ lv_rc }): { lv_msg }|
+        it_stdout  = lt_stdout ).
     ENDIF.
   ENDMETHOD.
 
@@ -747,6 +787,13 @@ CLASS lcl_application IMPLEMENTATION.
         ENDCASE.
       CATCH cx_root INTO mx_message.
         WRITE / mx_message->get_text( ) COLOR COL_NEGATIVE.
+        " If the failure carries tp stdout output, dump it for diagnostics
+        IF mx_message IS INSTANCE OF lcx_transport_manager_message.
+          DATA(lo_tm_msg) = CAST lcx_transport_manager_message( mx_message ).
+          LOOP AT lo_tm_msg->mt_stdout ASSIGNING FIELD-SYMBOL(<fs_stdout>).
+            WRITE / <fs_stdout>-line COLOR COL_NEGATIVE.
+          ENDLOOP.
+        ENDIF.
     ENDTRY.
   ENDMETHOD.
 
