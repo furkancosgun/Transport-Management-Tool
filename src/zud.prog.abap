@@ -22,7 +22,9 @@ SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE t02.
 
   " Upload Parameters
   PARAMETERS p_filenm TYPE string MODIF ID m2 LOWER CASE.
-  PARAMETERS p_import AS CHECKBOX MODIF ID m2 DEFAULT 'X'.
+  PARAMETERS p_imprt  RADIOBUTTON GROUP gr2 MODIF ID m2 DEFAULT 'X'.
+  PARAMETERS p_pop    RADIOBUTTON GROUP gr2 MODIF ID m2.
+  PARAMETERS p_noimp  RADIOBUTTON GROUP gr2 MODIF ID m2.
 SELECTION-SCREEN END OF BLOCK b2.
 
 " -----------------------------------------------------------------------
@@ -35,6 +37,8 @@ CLASS lcx_transport_manager_message DEFINITION
   PUBLIC SECTION.
     INTERFACES if_t100_dyn_msg.
     INTERFACES if_t100_message.
+
+    TYPES tt_stdout TYPE STANDARD TABLE OF tpstdout WITH DEFAULT KEY.
 
     CONSTANTS:
       BEGIN OF mc_general_error,
@@ -50,6 +54,7 @@ CLASS lcx_transport_manager_message DEFINITION
     DATA msgv2 TYPE msgv2.
     DATA msgv3 TYPE msgv3.
     DATA msgv4 TYPE msgv4.
+    DATA mt_stdout TYPE tt_stdout.
 
     METHODS constructor
       IMPORTING textid    LIKE if_t100_message=>t100key OPTIONAL
@@ -65,6 +70,11 @@ CLASS lcx_transport_manager_message DEFINITION
 
     CLASS-METHODS raise_syst
       RAISING lcx_transport_manager_message.
+
+    CLASS-METHODS raise_tp_failure
+      IMPORTING iv_message TYPE string
+                it_stdout  TYPE tt_stdout
+      RAISING   lcx_transport_manager_message.
 
   PRIVATE SECTION.
     DATA message TYPE string.
@@ -114,6 +124,25 @@ CLASS lcx_transport_manager_message IMPLEMENTATION.
                 msgv2  = lv_message+050(50)
                 msgv3  = lv_message+100(50)
                 msgv4  = lv_message+150(50).
+  ENDMETHOD.
+
+  METHOD raise_tp_failure.
+    " Raises exception carrying a custom message AND tp stdout output
+    DATA lv_message TYPE c LENGTH 200.
+    DATA lo_ex      TYPE REF TO lcx_transport_manager_message.
+
+    lv_message = iv_message.
+
+    lo_ex = NEW lcx_transport_manager_message(
+      textid = lcx_transport_manager_message=>mc_general_error
+      msgv1  = lv_message+000(50)
+      msgv2  = lv_message+050(50)
+      msgv3  = lv_message+100(50)
+      msgv4  = lv_message+150(50) ).
+
+    lo_ex->mt_stdout = it_stdout.
+
+    RAISE EXCEPTION lo_ex.
   ENDMETHOD.
 ENDCLASS.
 
@@ -305,6 +334,10 @@ CLASS lcl_transport_manager DEFINITION.
       IMPORTING iv_request TYPE trkorr
       RAISING   lcx_transport_manager_message.
 
+    METHODS populate_request_tables
+      IMPORTING iv_request TYPE trkorr
+      RAISING   lcx_transport_manager_message.
+
   PRIVATE SECTION.
     CONSTANTS:
       BEGIN OF mc_paths,
@@ -490,6 +523,81 @@ CLASS lcl_transport_manager IMPLEMENTATION.
     ENDIF.
   ENDMETHOD.
 
+  METHOD populate_request_tables.
+    " Appends TR to buffer and populates E07* tables via tp cmd
+    " (object-list import phase) WITHOUT performing a real import.
+    " Equivalent of OS-level: tp cmd <TR> <SID> pf=<tp_profile>
+    DATA lv_system  TYPE tmsbuffer-sysnam.
+    DATA lv_client  TYPE tmsbuffer-tarcli.
+    DATA lv_request TYPE tmsbuffer-trkorr.
+    DATA lv_rc      TYPE stpa-retcode.
+    DATA lv_msg     TYPE stpa-message.
+    DATA lt_stdout  TYPE lcx_transport_manager_message=>tt_stdout.
+    DATA lv_syst_msg TYPE c LENGTH 200.
+
+    lv_system  = sy-sysid.
+    lv_client  = sy-mandt.
+    lv_request = iv_request.
+
+    " Authority check for adding to buffer
+    CALL FUNCTION 'TR_AUTHORITY_CHECK_ADMIN'
+      EXPORTING  iv_adminfunction = 'TADD'
+      EXCEPTIONS OTHERS           = 1.
+    IF sy-subrc <> 0.
+      lcx_transport_manager_message=>raise_syst( ).
+    ENDIF.
+
+    " Add TR to the import queue (so it's visible in STMS)
+    CALL FUNCTION 'TMS_UI_APPEND_TR_REQUEST'
+      EXPORTING  iv_system      = lv_system
+                 iv_request     = lv_request
+                 iv_expert_mode = 'X'
+                 iv_ctc_active  = 'X'
+      EXCEPTIONS OTHERS         = 1.
+    IF sy-subrc <> 0.
+      lcx_transport_manager_message=>raise_syst( ).
+    ENDIF.
+
+    " Object-list import phase: populates E070, E071, E07T, E071K from
+    " the cofile/data files without running the actual import phases.
+    " 'CMD' = IF_OCS_TRANSPORT_SYSTEM_ACCESS=>C_CMD_OBJLST_IMPORT.
+    CALL FUNCTION 'TRINT_TP_INTERFACE'
+      EXPORTING  iv_tp_command                = 'CMD'
+                 iv_system_name               = lv_system
+                 iv_transport_request         = lv_request
+                 iv_client                    = lv_client
+      IMPORTING  ev_tp_return_code            = lv_rc
+                 ev_tp_message                = lv_msg
+      TABLES     tt_stdout                    = lt_stdout
+      EXCEPTIONS unsupported_tp_command       = 1
+                 invalid_tp_command           = 2
+                 missing_parameter            = 3
+                 invalid_parameter            = 4
+                 get_tpparam_failed           = 5
+                 update_tp_destination_failed = 6
+                 get_tms_info_failed          = 7
+                 permission_denied            = 8
+                 tp_call_failed               = 9
+                 insert_tpstat_failed         = 10
+                 insert_tplog_failed          = 11
+                 OTHERS                       = 12.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              INTO lv_syst_msg
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      lcx_transport_manager_message=>raise_tp_failure(
+        iv_message = CONV string( lv_syst_msg )
+        it_stdout  = lt_stdout ).
+    ENDIF.
+
+    " tp return codes > 4 indicate errors (0/4 = OK / warnings).
+    IF lv_rc > 4.
+      lcx_transport_manager_message=>raise_tp_failure(
+        iv_message = |Populate failed (tp RC={ lv_rc }): { lv_msg }|
+        it_stdout  = lt_stdout ).
+    ENDIF.
+  ENDMETHOD.
+
   METHOD get_req_files_from_client.
     " Reads local ZIP and extracts TR cofile/data components
     DATA lo_zip    TYPE REF TO cl_abap_zip.
@@ -592,7 +700,9 @@ CLASS lcl_application DEFINITION.
         t02      TYPE string VALUE 'Configuration',
         upload   TYPE string VALUE 'Upload to Server',
         download TYPE string VALUE 'Download to Client',
-        import   TYPE string VALUE 'Auto-Import after Upload',
+        import   TYPE string VALUE 'Import after Upload',
+        populate TYPE string VALUE 'Populate Transport Tables Only',
+        no_imp   TYPE string VALUE 'No Import Action',
       END OF mc_texts.
 
     CONSTANTS:
@@ -600,6 +710,7 @@ CLASS lcl_application DEFINITION.
         download_ok                TYPE string VALUE 'SUCCESS: Transport downloaded successfully.',
         upload_ok                  TYPE string VALUE 'SUCCESS: Transport uploaded to server.',
         import_ok                  TYPE string VALUE 'SUCCESS: Import process triggered.',
+        populate_ok                TYPE string VALUE 'SUCCESS: Transport tables populated (no import performed).',
         request_must_be_provided   TYPE string VALUE 'Error: Please specify a Transport Request.',
         file_name_must_be_provided TYPE string VALUE 'Error: Source ZIP file path is required.',
         folder_must_be_provided    TYPE string VALUE 'Error: Target folder path is required.',
@@ -618,7 +729,9 @@ CLASS lcl_application IMPLEMENTATION.
     %_p_trkorr_%_app_%-text = mc_texts-request.
     %_p_folder_%_app_%-text = mc_texts-folder.
     %_p_filenm_%_app_%-text = mc_texts-file.
-    %_p_import_%_app_%-text = mc_texts-import.
+    %_p_imprt_%_app_%-text  = mc_texts-import.
+    %_p_pop_%_app_%-text    = mc_texts-populate.
+    %_p_noimp_%_app_%-text  = mc_texts-no_imp.
 
     t01 = mc_texts-t01.
     t02 = mc_texts-t02.
@@ -662,13 +775,25 @@ CLASS lcl_application IMPLEMENTATION.
             mo_transport_manager->upload_request( EXPORTING iv_filename = p_filenm
                                                   IMPORTING ev_request  = lv_request ).
             WRITE / mc_messages-upload_ok COLOR COL_POSITIVE.
-            IF p_import = abap_true.
-              mo_transport_manager->import_request( iv_request = lv_request ).
-              WRITE / mc_messages-import_ok COLOR COL_POSITIVE.
-            ENDIF.
+
+            CASE abap_true.
+              WHEN p_imprt.
+                mo_transport_manager->import_request( iv_request = lv_request ).
+                WRITE / mc_messages-import_ok COLOR COL_POSITIVE.
+              WHEN p_pop.
+                mo_transport_manager->populate_request_tables( iv_request = lv_request ).
+                WRITE / mc_messages-populate_ok COLOR COL_POSITIVE.
+            ENDCASE.
         ENDCASE.
       CATCH cx_root INTO mx_message.
         WRITE / mx_message->get_text( ) COLOR COL_NEGATIVE.
+        " If the failure carries tp stdout output, dump it for diagnostics
+        IF mx_message IS INSTANCE OF lcx_transport_manager_message.
+          DATA(lo_tm_msg) = CAST lcx_transport_manager_message( mx_message ).
+          LOOP AT lo_tm_msg->mt_stdout ASSIGNING FIELD-SYMBOL(<fs_stdout>).
+            WRITE / <fs_stdout>-line COLOR COL_NEGATIVE.
+          ENDLOOP.
+        ENDIF.
     ENDTRY.
   ENDMETHOD.
 
